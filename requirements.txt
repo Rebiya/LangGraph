@@ -1,0 +1,17 @@
+langgraph
+langchain
+langchain-core
+langchain-community
+langchain-google-genai >= 1.0.0
+pydantic
+python-dotenv
+typing-extensions
+ipykernel
+packaging
+tavily-python
+langchain-tavily
+sqlalchemy
+google-generativeai
+requests
+httpx
+tiktoken
