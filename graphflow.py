@@ -10,6 +10,7 @@ from typing import Annotated, Sequence, TypedDict, List, Dict, Any, Optional
 from datetime import datetime
 import tiktoken
 
+from langchain_community.utilities import GoogleSerperAPIWrapper
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -17,7 +18,6 @@ from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_tavily import TavilySearch
 import google.generativeai as genai
 
 # Load environment variables
@@ -26,7 +26,7 @@ load_dotenv()
 # Initialize Gemini LLM
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
+    model="gemini-1.5-flash",
     temperature=0.7,
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
@@ -187,8 +187,8 @@ class TokenManager:
             return messages
         
         # Keep recent messages and summarize older ones
-        recent_messages = messages[-5:]  # Keep last 5 messages
-        older_messages = messages[:-5]
+        recent_messages = messages[-2:]  # Keep last 5 messages
+        older_messages = messages[:-2]
         
         if older_messages:
             # Create summary of older messages
@@ -204,17 +204,46 @@ memory_manager = MemoryManager()
 token_manager = TokenManager()
 
 # Initialize Tavily search tool
-tavily_tool = TavilySearch(api_key=os.getenv("TAVILY_API_KEY"), max_results=5)
-print(tavily_tool.invoke({"query": "test query"}))
+
+# Initialize Serper API wrapper with your API key from environment
+serper_tool = GoogleSerperAPIWrapper(k=2, api_key=os.getenv("SERPER_API_KEY"))
 
 @tool
-def web_search_tool(query: str) -> str:
-    """Search the web for real-time information"""
+def web_search_tool(query: str) -> dict:
+    """Perform a robust web search using Serper.dev and return structured results."""
     try:
-        results = tavily_tool.invoke({"query": query})
-        return json.dumps(results)
+        # Get raw results from Serper
+        raw_results = serper_tool.results(query)  # Returns dict with 'organic'
+
+        # Debug: log raw Serper response for visibility
+        print("===== Serper Raw Response =====")
+        print(f"Type: {type(raw_results)}")
+        print(f"Content: {raw_results}")
+        print("================================")
+
+        # Extract organic results safely
+        organic_results = raw_results.get("organic", [])
+        if not organic_results:
+            return {"results": []}
+
+        # Limit to top 2 results
+        formatted_results = [
+            {
+                "title": r.get("title", "No title"),
+                "content": r.get("snippet", "No content"),
+                "url": r.get("link", "")
+            }
+            for r in organic_results[:2]
+        ]
+
+        return {"results": formatted_results}
+
     except Exception as e:
-        return f"Search error: {str(e)}"
+        error_msg = f"Search service unavailable: {str(e)}"
+        print(f"===== Serper Error =====")
+        print(error_msg)
+        print("========================")
+        return {"error": error_msg}
 
 @tool
 def email_draft_tool(query: str, recipient: str = None) -> str:
@@ -275,63 +304,63 @@ def post_processing_node(state: GraphFlowState) -> GraphFlowState:
             "hitl_active": True
         })
     
-    # Debug: Log state updates
-    print(f"Post-processing updates: {updates}")
-    
     return updates
 
-def web_search_node(state: GraphFlowState) -> GraphFlowState:
-    """Web Search Node - Handle search queries with Tavily"""
+
+# --- Web Search Node for GraphFlow ---
+def web_search_node(state: dict) -> dict:
+    """Web Search Node - Integrates Serper + LLM with safe error handling."""
+    user_query = state.get("user_query", "")
     try:
         # Perform web search
-        search_results = web_search_tool.invoke(state["user_query"])
-        
-        # Debug: Log raw search results
-        print(f"Raw search results: {search_results}")
-        
+        search_output = web_search_tool.invoke(user_query)
+
+        # Log the processed search output
+        print(f"===== Processed Search Output for '{user_query}' =====")
+        print(json.dumps(search_output, indent=2))
+        print("================================================")
+
+        # Check for errors
+        if "error" in search_output:
+            response_text = f"Sorry, I couldn't fetch search results: {search_output['error']}. Please try rephrasing your query."
+            print(f"Error response: {response_text}")
+            return {"messages": [AIMessage(content=response_text)], "search_results": None}
+
+        # Extract results safely
+        search_results = search_output.get("results", [])
         if not search_results:
-            error_response = "No search results found. Please try a different query."
-            return {
-                "messages": [AIMessage(content=error_response)],
-                "search_results": None
-            }
-        
-        # Attempt to parse JSON
-        try:
-            search_data = json.loads(search_results)
-        except json.JSONDecodeError as json_err:
-            error_response = f"Failed to parse search results: {str(json_err)}. Please try rephrasing your query."
-            return {
-                "messages": [AIMessage(content=error_response)],
-                "search_results": None
-            }
-        
-        # Generate response using Gemini
-        search_context = f"Search results for '{state['user_query']}':\n{json.dumps(search_data, indent=2)}"
-        response = llm.invoke([
-            HumanMessage(content=f"Based on these search results, provide a helpful response: {search_context}")
+            response_text = "No search results found. Please try rephrasing your query."
+            print(f"No results: {response_text}")
+            return {"messages": [AIMessage(content=response_text)], "search_results": None}
+
+        # Format search results for LLM
+        formatted_results = "\n".join([
+            f"• {r['title']}: {r['content'][:200]}..." for r in search_results
         ])
-        
-        # Store interaction
-        memory_manager.store_interaction(
-            node_type="web_search",
-            user_query=state["user_query"],
-            ai_response=response.content,
-            tool_output=search_results,
-            token_count=token_manager.count_tokens(response.content)
-        )
-        
-        return {
-            "messages": [AIMessage(content=response.content)],
-            "search_results": search_data
-        }
-        
+        search_context = f"Search results for '{user_query}':\n{formatted_results}"
+        print(f"===== Search Context for LLM =====")
+        print(search_context)
+        print("=================================")
+
+        # Call your LLM (Gemini or other)
+        response = llm.invoke([
+            HumanMessage(content=f"Based on these search results, provide a concise and informative answer:\n{search_context}")
+        ])
+
+        print(f"===== LLM Response =====")
+        print(f"{response.content[:100]}...")
+        print("=======================")
+
+        return {"messages": [AIMessage(content=response.content)], "search_results": search_results}
+
     except Exception as e:
-        error_response = f"I encountered an error while searching: {str(e)}. Please try rephrasing your query."
-        return {
-            "messages": [AIMessage(content=error_response)],
-            "search_results": None
-        }
+        error_response = f"I encountered an issue with the search: {str(e)}. Please try rephrasing your query."
+        print(f"===== Web Search Node Error =====")
+        print(error_response)
+        print("================================")
+        return {"messages": [AIMessage(content=error_response)], "search_results": None}
+
+
 def email_draft_node(state: GraphFlowState) -> GraphFlowState:
     """Email Drafter Node - Draft emails using Gemini"""
     try:
@@ -400,7 +429,7 @@ def memory_node(state: GraphFlowState) -> GraphFlowState:
 
 
 def should_continue(state: GraphFlowState) -> str:
-    print(f"Routing from router, current_node: {state['current_node']}")
+    # Decide next node from router
     if state["current_node"] == "web_search":
         return "web_search"
     elif state["current_node"] == "email_draft":
@@ -411,7 +440,7 @@ def should_continue(state: GraphFlowState) -> str:
         return "post_processing"
 
 def should_continue_after_processing(state: GraphFlowState) -> str:
-    print(f"Routing from post_processing, hitl_active: {state.get('hitl_active', False)}")
+    # Decide next step after post-processing
     if state.get("hitl_active", False):
         return "hitl"
     else:
@@ -472,7 +501,7 @@ class GraphFlow:
         self.workflow = create_graphflow_workflow()
         self.memory_manager = memory_manager
         self.token_manager = token_manager
-    
+
     def process_query(self, user_query: str) -> Dict[str, Any]:
         """Process a user query through the GraphFlow workflow"""
         try:
@@ -488,10 +517,10 @@ class GraphFlow:
                 "memory_data": {},
                 "token_count": 0
             }
-            
+
             # Process through workflow
             result = self.workflow.invoke(initial_state)
-            
+
             # Extract response
             if result["messages"]:
                 last_message = result["messages"][-1]
@@ -501,16 +530,18 @@ class GraphFlow:
                         "node_type": result["current_node"],
                         "hitl_active": result["hitl_active"]
                     }
-            
+
             return {
                 "content": "I'm processing your request. Please wait a moment.",
                 "node_type": result["current_node"],
                 "hitl_active": result["hitl_active"]
             }
-            
+
         except Exception as e:
+            # FIXED: Ensure all exception objects are converted to strings
+            error_message = f"I encountered an error: {str(e)}. Please try again."
             return {
-                "content": f"I encountered an error: {str(e)}. Please try again.",
+                "content": error_message,
                 "node_type": "error",
                 "hitl_active": False
             }
