@@ -1,5 +1,9 @@
 # GraphFlow - Human-in-the-Loop System 
-![GraphFlow Architecture](https://drive.google.com/uc?export=view&id=1aBcD3EfGhIJKlmnOPqRstUVwxYZ)
+
+## 📁 Project Diagrams
+
+- [GraphFlow Architecture Diagram](https://drive.google.com/file/d/1NGgb0e0XFwjVnxFjnU5Mw6Iu4PyFj8vY/view?usp=sharing)
+- [Linear GraphFlow Diagram](https://drive.google.com/file/d/17yuaP9ECqrm3WKNdhC0ztHkazf1oFJFi/view?usp=sharing)
 
 
 A sophisticated workflow agent built with LangGraph, LangChain, and LangSmith that handles user queries through structured nodes with dynamic human-in-the-loop (HITL) interactions.
@@ -223,7 +227,6 @@ python cli.py
 ---
 
 # Linear GraphFlow - Sequential LangChain Implementation
-![Linear GraphFlow Diagram](https://drive.google.com/uc?export=view&id=1AbCDEFGhiJKlmnOPqrStUVWXyz)
 
 
 
