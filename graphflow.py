@@ -6,10 +6,13 @@ A workflow agent that handles user queries via structured nodes with dynamic HIT
 import os
 import json
 import sqlite3
+import re
+import threading
+import time
 from typing import Annotated, Sequence, TypedDict, List, Dict, Any, Optional
 from datetime import datetime
-import tiktoken
-
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -26,31 +29,56 @@ load_dotenv()
 # Initialize Gemini LLM
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-flash-lite",
     temperature=0.7,
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
 
 # Token limit for context management
 LIMIT_TOKENS = 1500
+MAX_ITERATIONS = 5  # Maximum HITL iterations before forced termination
+
+# Structured output models for LLM responses
+class RouterResponse(BaseModel):
+    intent: str = Field(description="The classified intent: greeting, search, email, or memory")
+    response: str = Field(description="The response message to the user")
+    confidence: float = Field(description="Confidence score between 0 and 1", ge=0, le=1)
+
+class HITLResponse(BaseModel):
+    decision: str = Field(description="The decision: CONTINUE or END")
+    response: str = Field(description="The friendly response to the user")
+    reason: str = Field(description="Brief reason for the decision")
+
+# Output parsers
+router_parser = PydanticOutputParser(pydantic_object=RouterResponse)
+hitl_parser = PydanticOutputParser(pydantic_object=HITLResponse)
 
 class GraphFlowState(TypedDict):
     """State management for GraphFlow nodes"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     current_node: str
+    previous_node: str
     hitl_active: bool
+    hitl_flag: bool
     user_query: str
     search_results: Optional[Dict[str, Any]]
     email_draft: Optional[str]
     email_recipient: Optional[str]
     memory_data: Dict[str, Any]
     token_count: int
+    query_type: str
+    response: str
+    context: str
+    iteration_count: int
+    max_iterations_reached: bool
+    api_keys_available: Dict[str, bool]
 
 class MemoryManager:
-    """SQLite-based memory management for GraphFlow"""
+    """SQLite-based memory management for GraphFlow with concurrency handling"""
     
     def __init__(self, db_path: str = "conversations.db"):
         self.db_path = db_path
+        self.lock = threading.Lock()
         self.init_database()
     
     def init_database(self):
@@ -116,35 +144,82 @@ class MemoryManager:
     def store_interaction(self, node_type: str, user_query: str, ai_response: str, 
                          tool_output: str = None, hitl_interaction: str = None, 
                          token_count: int = 0, summary: str = None):
-        """Store interaction in database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO conversations 
-            (node_type, user_query, ai_response, tool_output, hitl_interaction, token_count, summary)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (node_type, user_query, ai_response, tool_output, hitl_interaction, token_count, summary))
-        
-        conn.commit()
-        conn.close()
+        """Store interaction in database with concurrency handling"""
+        with self.lock:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=30.0)
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    INSERT INTO conversations 
+                    (node_type, user_query, ai_response, tool_output, hitl_interaction, token_count, summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (node_type, user_query, ai_response, tool_output, hitl_interaction, token_count, summary))
+                
+                conn.commit()
+                conn.close()
+            except sqlite3.OperationalError as e:
+                print(f"[MemoryManager Error]: Database timeout: {str(e)}")
+                time.sleep(0.1)  # Brief delay before retry
+                # Retry once
+                try:
+                    conn = sqlite3.connect(self.db_path, timeout=60.0)
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO conversations 
+                        (node_type, user_query, ai_response, tool_output, hitl_interaction, token_count, summary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (node_type, user_query, ai_response, tool_output, hitl_interaction, token_count, summary))
+                    conn.commit()
+                    conn.close()
+                except Exception as retry_e:
+                    print(f"[MemoryManager Error]: Retry failed: {str(retry_e)}")
     
     def get_recent_messages(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent conversation history"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT * FROM conversations 
-            ORDER BY id DESC 
-            LIMIT ?
-        ''', (limit,))
-        
-        results = cursor.fetchall()
-        cols = [col[0] for col in cursor.description]
-        conn.close()
-        
-        return [dict(zip(cols, row)) for row in results]
+        """Get recent conversation history with concurrency handling"""
+        with self.lock:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=30.0)
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT * FROM conversations 
+                    ORDER BY id DESC 
+                    LIMIT ?
+                ''', (limit,))
+                
+                results = cursor.fetchall()
+                cols = [col[0] for col in cursor.description]
+                conn.close()
+                
+                return [dict(zip(cols, row)) for row in results]
+            except sqlite3.OperationalError as e:
+                print(f"[MemoryManager Error]: Database timeout: {str(e)}")
+                return []
+    
+    def get_semantic_memory(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get semantically relevant conversation history using simple text matching"""
+        with self.lock:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=30.0)
+                cursor = conn.cursor()
+                
+                # Simple semantic matching using LIKE queries
+                cursor.execute('''
+                    SELECT * FROM conversations 
+                    WHERE user_query LIKE ? OR ai_response LIKE ? OR summary LIKE ?
+                    ORDER BY id DESC 
+                    LIMIT ?
+                ''', (f'%{query}%', f'%{query}%', f'%{query}%', limit))
+                
+                results = cursor.fetchall()
+                cols = [col[0] for col in cursor.description]
+                conn.close()
+                
+                return [dict(zip(cols, row)) for row in results]
+            except sqlite3.OperationalError as e:
+                print(f"[MemoryManager Error]: Database timeout: {str(e)}")
+                return []
     
     def store_state(self, state_data: Dict[str, Any], node_state: str):
         """Store current state"""
@@ -170,38 +245,212 @@ class MemoryManager:
         conn.close()
 
 class TokenManager:
-    """Handle token counting and message summarization"""
+    """Handle token counting and message summarization with LLM-based summarization"""
     
     def __init__(self):
-        self.encoding = tiktoken.get_encoding("cl100k_base")
+        pass
     
     def count_tokens(self, text: str) -> int:
-        """Count tokens in text"""
-        return len(self.encoding.encode(text))
+        """Count tokens in text using Gemini-compatible estimator"""
+        return count_tokens_gemini(text)
     
     def summarize_messages(self, messages: List[BaseMessage]) -> List[BaseMessage]:
-        """Summarize older messages to stay within token limit"""
+        """Summarize older messages to stay within token limit using LLM-based summarization"""
         total_tokens = sum(self.count_tokens(str(msg.content)) for msg in messages)
         
         if total_tokens <= LIMIT_TOKENS:
             return messages
         
         # Keep recent messages and summarize older ones
-        recent_messages = messages[-2:]  # Keep last 5 messages
-        older_messages = messages[:-2]
+        recent_messages = messages[-3:]  # Keep last 3 messages
+        older_messages = messages[:-3]
         
-        if older_messages:
-            # Create summary of older messages
-            summary_content = f"Previous conversation summary: {len(older_messages)} messages about various topics including search queries and email drafting."
-            summary_message = SystemMessage(content=summary_content)
-            
-            return [summary_message] + recent_messages
+        if older_messages and len(older_messages) > 2:
+            try:
+                # Use LLM to create intelligent summary
+                older_content = "\n".join([f"{type(msg).__name__}: {msg.content}" for msg in older_messages])
+                summary_prompt = f"""Summarize the following conversation history concisely while preserving key information:
+
+{older_content}
+
+Provide a brief summary that captures the main topics, decisions, and outcomes."""
+                
+                summary_response = llm.invoke([HumanMessage(content=summary_prompt)])
+                summary_content = f"Previous conversation summary: {summary_response.content}"
+                summary_message = SystemMessage(content=summary_content)
+                
+                return [summary_message] + recent_messages
+            except Exception as e:
+                print(f"[TokenManager Error]: LLM summarization failed: {str(e)}")
+                # Fallback to simple summary
+                summary_content = f"Previous conversation summary: {len(older_messages)} messages about various topics."
+                summary_message = SystemMessage(content=summary_content)
+                return [summary_message] + recent_messages
         
         return recent_messages
 
 # Initialize managers
 memory_manager = MemoryManager()
 token_manager = TokenManager()
+
+# API key validation
+def check_api_keys() -> Dict[str, bool]:
+    """Check availability of required API keys"""
+    return {
+        "google_api": bool(os.getenv("GOOGLE_API_KEY")),
+        "serper_api": bool(os.getenv("SERPER_API_KEY"))
+    }
+
+# Enhanced safe execution with iteration limits
+def safe_node_execution(node_func, state, node_name: str):
+    """Wrap node execution with try/except, iteration limits, and safe state updates"""
+    try:
+        # Check iteration limits for HITL nodes
+        if node_name == "hitl" and state.get("iteration_count", 0) >= MAX_ITERATIONS:
+            print(f"[{node_name} Warning]: Maximum iterations ({MAX_ITERATIONS}) reached, forcing termination")
+            state.update({
+                "current_node": "end",
+                "hitl_active": False,
+                "hitl_flag": False,
+                "max_iterations_reached": True
+            })
+            return state
+        
+        result = node_func(state)
+        # Merge returned partial state with current state
+        state.update(result)
+        # Ensure essential keys exist
+        for key in ["messages", "current_node", "hitl_active", "hitl_flag"]:
+            if key not in state:
+                state[key] = [] if key == "messages" else False
+        return state
+    except Exception as e:
+        err_msg = f"[{node_name} Error]: {str(e)}"
+        print(err_msg)
+        # Append error message to conversation messages
+        if "messages" not in state or state["messages"] is None:
+            state["messages"] = []
+        state["messages"].append(AIMessage(content=err_msg))
+        # End workflow gracefully
+        state["current_node"] = "end"
+        state["hitl_active"] = False
+        state["hitl_flag"] = False
+        return state
+
+
+# 2️⃣ Gemini-compatible token estimator
+def count_tokens_gemini(text: str) -> int:
+    """Estimate tokens by simple word split for Gemini LLMs"""
+    return len(text.split())
+
+# 3️⃣ Append messages instead of overwriting
+def append_message(state: GraphFlowState, message: BaseMessage):
+    if "messages" not in state or state["messages"] is None:
+        state["messages"] = []
+    state["messages"].append(message)
+    return state
+
+# 4️⃣ Safe router parsing
+def parse_router_response(response_text: str):
+    """Robustly parse INTENT & RESPONSE from router LLM output"""
+    intent, router_resp = "search", ""
+    try:
+        lines = response_text.splitlines()
+        for line in lines:
+            if line.startswith("INTENT:"):
+                intent = line.split(":", 1)[1].strip().lower()
+            elif line.startswith("RESPONSE:"):
+                router_resp = line.split(":", 1)[1].strip()
+        # Fallback: regex if formatting unexpected
+        if not intent:
+            match = re.search(r"INTENT:\s*(\w+)", response_text)
+            if match:
+                intent = match.group(1).lower()
+        if not router_resp:
+            match = re.search(r"RESPONSE:\s*(.*)", response_text)
+            if match:
+                router_resp = match.group(1).strip()
+    except Exception as e:
+        print(f"[Router Parse Error]: {str(e)}")
+    return intent, router_resp
+
+# 5️⃣ Safe HITL parsing
+def parse_hitl_response(response_text: str):
+    """Extract DECISION, RESPONSE, REASON from HITL output robustly"""
+    decision, human_resp, reason = "END", "Thank you!", "Defaulted decision"
+    try:
+        match = re.search(r"DECISION:(.*)\nRESPONSE:(.*)\nREASON:(.*)", response_text, re.S)
+        if match:
+            decision, human_resp, reason = [s.strip() for s in match.groups()]
+        else:
+            for line in response_text.splitlines():
+                if line.startswith("DECISION:"):
+                    decision = line.split(":", 1)[1].strip().upper()
+                elif line.startswith("RESPONSE:"):
+                    human_resp = line.split(":", 1)[1].strip()
+                elif line.startswith("REASON:"):
+                    reason = line.split(":", 1)[1].strip()
+    except Exception as e:
+        print(f"[HITL Parse Error]: {str(e)}")
+    return decision, human_resp, reason
+
+def starter_node(state: GraphFlowState) -> GraphFlowState:
+    """Starter Node - Main entry point that initializes the flow"""
+    print("🚀 Starting GraphFlow workflow...")
+    
+    # Initialize state with default values
+    updates = {
+        "current_node": "router",
+        "previous_node": "starter",
+        "hitl_active": False,
+        "hitl_flag": False,
+        "query_type": "unknown",
+        "response": "",
+        "context": "",
+        "iteration_count": 0
+    }
+    
+    # Store initial interaction
+    memory_manager.store_interaction(
+        node_type="starter",
+        user_query=state["user_query"],
+        ai_response="Workflow initialized",
+        hitl_interaction="flow_start"
+    )
+    
+    print(f"Transition: starter -> router")
+    return updates
+
+def end_node(state: GraphFlowState) -> GraphFlowState:
+    """End Node - Terminates flow, no LLM, just finalizes session"""
+    print("🏁 Ending GraphFlow workflow...")
+    
+    # Save the last message and full state to SQLite
+    memory_manager.store_state(state, "end")
+    
+    # Store final interaction
+    memory_manager.store_interaction(
+        node_type="end",
+        user_query=state["user_query"],
+        ai_response=state.get("response", "Workflow completed"),
+        hitl_interaction="flow_end",
+        summary=f"Completed {state.get('iteration_count', 0)} iterations"
+    )
+    
+    # Reset transient flags
+    state.update({"hitl_flag": False, "hitl_active": False})
+    
+    # Append final message if not already present
+    final_message = "Thank you for using GraphFlow! Have a great day!"
+    state = append_message(state, AIMessage(content=final_message))
+    
+    print(f"Transition: end -> END")
+    return {
+        "current_node": END,
+        "previous_node": "end",
+        "hitl_active": False,
+        "hitl_flag": False
+    }
 
 # Initialize Tavily search tool
 
@@ -259,58 +508,102 @@ def email_draft_tool(query: str, recipient: str = None) -> str:
         return f"Email drafting error: {str(e)}"
 
 def router_node(state: GraphFlowState) -> GraphFlowState:
-    """Router Node - Determine query type and route accordingly"""
-    user_query = state["user_query"].lower()
+    """Router Node - LLM-driven query analyzer with structured outputs and API key guards"""
+    user_query = state["user_query"]
     
-    # Simple routing logic based on keywords
-    if any(keyword in user_query for keyword in ["search", "find", "look up", "what is", "how to"]):
-        next_node = "web_search"
-    elif any(keyword in user_query for keyword in ["email", "draft", "send", "message", "write"]):
-        next_node = "email_draft"
-    else:
-        # Ask for clarification
-        next_node = "hitl_clarification"
+    # Check API keys availability
+    api_keys = check_api_keys()
+    state["api_keys_available"] = api_keys
     
-    # Store routing decision internally
-    memory_manager.store_interaction(
-        node_type="router",
-        user_query=state["user_query"],
-        ai_response=f"Internal routing to {next_node}",
-        hitl_interaction="routing_decision"
-    )
+    # Summarize & manage tokens
+    state = append_message(state, HumanMessage(content=user_query))
+    summarized_messages = token_manager.summarize_messages(state["messages"])
+    state["messages"] = summarized_messages
     
-    return {
-        "current_node": next_node,
-        "hitl_active": next_node == "hitl_clarification"
-    }
+    # LLM call with structured output
+    try:
+        system_msg = SystemMessage(content=f"""You are a polite and warm assistant. Classify the user's intent and respond appropriately.
 
-def post_processing_node(state: GraphFlowState) -> GraphFlowState:
-    """Post-processing node to handle HITL routing after main nodes complete"""
-    updates = {}
+        Classify the user's intent as one of: greeting, search, email, or memory.
+        
+        If it's a greeting (hi, hello, hey, good morning, etc.), respond with a polite, human-like greeting.
+        If it's a search task (looking for information, facts, current events), indicate it needs web search.
+        If it's an email task (drafting, writing, sending emails), indicate it needs email drafting.
+        If it's context-based (asking about previous conversations, memory), indicate it needs memory retrieval.
+        
+        {router_parser.get_format_instructions()}""")
+        
+        response = llm.invoke([system_msg, HumanMessage(content=user_query)])
+        parsed_response = router_parser.parse(response.content)
+        intent = parsed_response.intent
+        router_resp = parsed_response.response
+        confidence = parsed_response.confidence
+        
+        # If confidence is low, default to search
+        if confidence < 0.5:
+            intent = "search"
+            router_resp = "I'll help you search for information."
+            
+    except Exception as e:
+        print(f"[Router LLM Error]: {str(e)}")
+        intent, router_resp = "search", f"Error: {str(e)}"
+
+    # Append response message
+    state = append_message(state, AIMessage(content=router_resp))
     
-    # Check if we have results that need HITL interaction
-    if "search_results" in state and state["search_results"]:
-        updates.update({
-            "current_node": "hitl_web_search",
-            "hitl_active": True
-        })
-    elif "email_draft" in state and state["email_draft"]:
-        updates.update({
-            "current_node": "hitl_email_draft",
-            "hitl_active": True
-        })
-    elif state.get("current_node") == "hitl_clarification":
-        updates.update({
-            "hitl_active": True
-        })
+    # Decide next node safely with API key checks
+    if intent == "search" and not api_keys.get("serper_api", False):
+        intent = "end"
+        router_resp = "I'm sorry, but the search functionality is not available. Please check your API configuration."
+    elif intent == "email" and not api_keys.get("google_api", False):
+        intent = "end"
+        router_resp = "I'm sorry, but the email functionality is not available. Please check your API configuration."
     
-    return updates
+    next_node = {
+        "greeting": "end",
+        "search": "websearch",
+        "email": "email_drafter",
+        "memory": "memory"
+    }.get(intent, "websearch")
+    
+    # Update state
+    state.update({
+        "current_node": next_node,
+        "previous_node": "router",
+        "query_type": intent,
+        "response": router_resp,
+        "hitl_active": False,
+        "hitl_flag": False
+    })
+    
+    # Log to SQLite
+    memory_manager.store_interaction("router", user_query, router_resp)
+    print(f"Transition: router -> {next_node}")
+    return state
+
 
 
 # --- Web Search Node for GraphFlow ---
-def web_search_node(state: dict) -> dict:
-    """Web Search Node - Integrates Serper + LLM with safe error handling."""
+def websearch_node(state: GraphFlowState) -> GraphFlowState:
+    """Web Search Node - Integrates Serper + LLM with API key guards and safe error handling."""
     user_query = state.get("user_query", "")
+    
+    # Check API key availability
+    api_keys = state.get("api_keys_available", {})
+    if not api_keys.get("serper_api", False):
+        error_msg = "Search functionality is not available. Please check your SERPER_API_KEY configuration."
+        state = append_message(state, AIMessage(content=error_msg))
+        return {
+            "current_node": "end",
+            "previous_node": "websearch",
+            "hitl_active": False,
+            "hitl_flag": False
+        }
+    
+    # Token management before LLM call
+    summarized_messages = token_manager.summarize_messages(state["messages"])
+    state["messages"] = summarized_messages
+    
     try:
         # Perform web search
         search_output = web_search_tool.invoke(user_query)
@@ -324,14 +617,28 @@ def web_search_node(state: dict) -> dict:
         if "error" in search_output:
             response_text = f"Sorry, I couldn't fetch search results: {search_output['error']}. Please try rephrasing your query."
             print(f"Error response: {response_text}")
-            return {"messages": [AIMessage(content=response_text)], "search_results": None}
+            state = append_message(state, AIMessage(content=response_text))
+            return {
+                "search_results": None,
+                "current_node": "end",
+                "previous_node": "websearch",
+                "hitl_active": False,
+                "hitl_flag": False
+            }
 
         # Extract results safely
         search_results = search_output.get("results", [])
         if not search_results:
             response_text = "No search results found. Please try rephrasing your query."
             print(f"No results: {response_text}")
-            return {"messages": [AIMessage(content=response_text)], "search_results": None}
+            state = append_message(state, AIMessage(content=response_text))
+            return {
+                "search_results": None,
+                "current_node": "end",
+                "previous_node": "websearch",
+                "hitl_active": False,
+                "hitl_flag": False
+            }
 
         # Format search results for LLM
         formatted_results = "\n".join([
@@ -351,18 +658,40 @@ def web_search_node(state: dict) -> dict:
         print(f"{response.content[:100]}...")
         print("=======================")
 
-        return {"messages": [AIMessage(content=response.content)], "search_results": search_results}
+        # Enable iteration for web search - set HITL active for user feedback
+        print(f"Transition: websearch -> hitl")
+        state = append_message(state, AIMessage(content=response.content))
+        return {
+            "search_results": search_results,
+            "hitl_active": True,
+            "hitl_flag": True,
+            "current_node": "hitl",
+            "previous_node": "websearch",
+            "response": response.content,
+            "iteration_count": state.get("iteration_count", 0) + 1
+        }
 
     except Exception as e:
         error_response = f"I encountered an issue with the search: {str(e)}. Please try rephrasing your query."
         print(f"===== Web Search Node Error =====")
         print(error_response)
         print("================================")
-        return {"messages": [AIMessage(content=error_response)], "search_results": None}
+        state = append_message(state, AIMessage(content=error_response))
+        return {
+            "search_results": None,
+            "current_node": "end",
+            "previous_node": "websearch",
+            "hitl_active": False,
+            "hitl_flag": False
+        }
 
 
-def email_draft_node(state: GraphFlowState) -> GraphFlowState:
+def email_drafter_node(state: GraphFlowState) -> GraphFlowState:
     """Email Drafter Node - Draft emails using Gemini"""
+    # Token management before LLM call
+    summarized_messages = token_manager.summarize_messages(state["messages"])
+    state["messages"] = summarized_messages
+    
     try:
         # Draft email
         email_content = email_draft_tool.invoke(state["user_query"])
@@ -375,49 +704,173 @@ def email_draft_node(state: GraphFlowState) -> GraphFlowState:
             token_count=token_manager.count_tokens(email_content)
         )
         
+        # Enable iteration for email draft - set HITL active for user feedback
+        print(f"Transition: email_drafter -> hitl")
+        response_text = f"Here's your email draft:\n\n{email_content}"
+        state = append_message(state, AIMessage(content=response_text))
         return {
-            "messages": [AIMessage(content=f"Here's your email draft:\n\n{email_content}")],
-            "email_draft": email_content
+            "email_draft": email_content,
+            "hitl_active": True,
+            "hitl_flag": True,
+            "current_node": "hitl",
+            "previous_node": "email_drafter",
+            "response": response_text,
+            "iteration_count": state.get("iteration_count", 0) + 1
         }
         
     except Exception as e:
         error_response = f"I encountered an error while drafting the email: {str(e)}. Please try again."
+        state = append_message(state, AIMessage(content=error_response))
         return {
-            "messages": [AIMessage(content=error_response)]
+            "current_node": "end",
+            "previous_node": "email_drafter",
+            "hitl_active": False,
+            "hitl_flag": False
         }
 
 def hitl_node(state: GraphFlowState) -> GraphFlowState:
-    """Human-in-the-Loop Node - Handle dynamic user interactions"""
-    current_node = state["current_node"]
+    """Human-in-the-Loop Node - LLM-powered friendly human interaction with structured outputs and iteration limits"""
+    # Store the previous node name before calling LLM
+    previous_node = state.get("previous_node", "router")
+    user_query = state.get("user_query", "")
+    response = state.get("response", "")
+    query_type = state.get("query_type", "unknown")
+    iteration_count = state.get("iteration_count", 0)
     
-    if current_node == "hitl_clarification":
-        clarification = "I'm not sure what you'd like me to help with. Would you like me to:\n1. Search for information on a topic\n2. Help draft an email\n\nPlease let me know which option you prefer or provide more details about your request."
+    # Check iteration limits
+    if iteration_count >= MAX_ITERATIONS:
+        print(f"[HITL Warning]: Maximum iterations ({MAX_ITERATIONS}) reached, forcing termination")
+        termination_msg = f"I've reached the maximum number of iterations ({MAX_ITERATIONS}). Let me end this conversation here."
+        state = append_message(state, AIMessage(content=termination_msg))
+        return {
+            "current_node": "end",
+            "previous_node": "hitl",
+            "hitl_active": False,
+            "hitl_flag": False,
+            "max_iterations_reached": True,
+            "response": termination_msg
+        }
+    
+    # Token management before LLM call
+    summarized_messages = token_manager.summarize_messages(state["messages"])
+    state["messages"] = summarized_messages
+    
+    # System message for HITL LLM with structured output
+    system_message = SystemMessage(content=f"""You are a helpful assistant managing human-agent interactions. Be friendly, conversational, and clarify user intent.
+
+    Your job is to:
+    1. Engage in natural, friendly conversation with the user
+    2. Understand their feedback and needs
+    3. Decide whether to continue the current task (search/email) or finish the conversation
+    4. Be encouraging and helpful in your responses
+
+    Based on the user's response, decide:
+    - CONTINUE: If they want to iterate (more search, email changes, etc.)
+    - END: If they're satisfied or want to finish
+
+    {hitl_parser.get_format_instructions()}""")
+    
+    # Context about what was just completed
+    context_info = ""
+    if previous_node == "websearch":
+        context_info = f"We just completed a web search for: '{user_query}'. The search results were: {response[:200]}..."
+    elif previous_node == "email_drafter":
+        context_info = f"We just drafted an email for: '{user_query}'. The draft was: {response[:200]}..."
+    
+    try:
+        llm_response = llm.invoke([
+            system_message,
+            HumanMessage(content=f"""Context: {context_info}
+            
+            User's current query/feedback: '{user_query}'
+            
+            Please engage with the user and decide whether to continue or end the conversation.""")
+        ])
         
+        response_text = llm_response.content.strip()
+        print(f"🤖 HITL LLM Response: {response_text}")
+        
+        # Use structured parsing
+        try:
+            parsed_response = hitl_parser.parse(response_text)
+            decision = parsed_response.decision
+            human_resp = parsed_response.response
+            reason = parsed_response.reason
+        except Exception as parse_error:
+            print(f"[HITL Parse Error]: {str(parse_error)}")
+            # Fallback to safe parsing
+            decision, human_resp, reason = parse_hitl_response(response_text)
+        
+        # Store HITL interaction
+        memory_manager.store_interaction(
+            node_type="hitl",
+            user_query=user_query,
+            ai_response=human_resp,
+            hitl_interaction=f"decision_{decision.lower()}",
+            summary=reason
+        )
+        
+        # Append response message
+        state = append_message(state, AIMessage(content=human_resp))
+        
+        if decision == "CONTINUE":
+            # Continue with the previous node
+            print(f"Transition: hitl -> {previous_node}")
+            return {
+                "current_node": previous_node,
+                "previous_node": "hitl",
+                "hitl_active": True,
+                "hitl_flag": True,
+                "response": human_resp,
+                "iteration_count": iteration_count + 1,
+                "user_query": user_query  # Update user query for next iteration
+            }
+        else:
+            # End the conversation
+            print(f"Transition: hitl -> end")
+            return {
+                "current_node": "end",
+                "previous_node": "hitl",
+                "hitl_active": False,
+                "hitl_flag": False,
+                "response": human_resp
+            }
+            
+    except Exception as e:
+        print(f"❌ HITL LLM Error: {str(e)}")
+        # Fallback response
+        fallback_response = "I understand. Is there anything else I can help you with?"
+        print(f"Transition: hitl -> end (error fallback)")
+        state = append_message(state, AIMessage(content=fallback_response))
         return {
-            "messages": [AIMessage(content=clarification)],
-            "hitl_active": True
+            "current_node": "end",
+            "previous_node": "hitl",
+            "hitl_active": False,
+            "hitl_flag": False,
+            "response": fallback_response
         }
-    
-    elif current_node == "hitl_web_search":
-        question = "Would you like me to search for more specific information or expand on any of these results?"
-        return {
-            "messages": [AIMessage(content=question)],
-            "hitl_active": True
-        }
-    
-    elif current_node == "hitl_email_draft":
-        question = "Would you like me to adjust the tone, add more details, or make any other changes to this email draft?"
-        return {
-            "messages": [AIMessage(content=question)],
-            "hitl_active": True
-        }
-    
-    return state
 
 def memory_node(state: GraphFlowState) -> GraphFlowState:
-    """Memory Node - Manage state and context"""
+    """Memory Node - State persistence and semantic context retrieval"""
+    user_query = state["user_query"]
+    
     # Store current state
     memory_manager.store_state(state, state["current_node"])
+    
+    # Retrieve semantic context from memory
+    semantic_messages = memory_manager.get_semantic_memory(user_query, limit=5)
+    
+    # If no semantic matches, fall back to recent messages
+    if not semantic_messages:
+        semantic_messages = memory_manager.get_recent_messages(limit=3)
+    
+    # Build context from retrieved interactions
+    context_parts = []
+    for msg in semantic_messages:
+        if msg.get('node_type') in ['websearch', 'email_drafter', 'hitl']:
+            context_parts.append(f"{msg['node_type']}: {msg['ai_response'][:100]}...")
+    
+    context = "\n".join(context_parts) if context_parts else "No relevant context available."
     
     # Check token limits and summarize if needed
     if state["messages"]:
@@ -425,72 +878,122 @@ def memory_node(state: GraphFlowState) -> GraphFlowState:
         state["messages"] = summarized_messages
         state["token_count"] = sum(token_manager.count_tokens(str(msg.content)) for msg in summarized_messages)
     
-    return state
+    # Store memory interaction
+    memory_manager.store_interaction(
+        node_type="memory",
+        user_query=user_query,
+        ai_response=f"Retrieved semantic context: {context[:200]}...",
+        hitl_interaction="semantic_retrieval"
+    )
+    
+    # Append response message
+    response_text = f"Based on our previous conversations: {context[:200]}..."
+    state = append_message(state, AIMessage(content=response_text))
+    
+    print(f"Transition: memory -> end")
+    return {
+        "current_node": "end",
+        "previous_node": "memory",
+        "context": context,
+        "response": response_text,
+        "hitl_active": False,
+        "hitl_flag": False
+    }
 
 
 def should_continue(state: GraphFlowState) -> str:
-    # Decide next node from router
-    if state["current_node"] == "web_search":
-        return "web_search"
-    elif state["current_node"] == "email_draft":
-        return "email_draft"
-    elif state["current_node"] == "hitl_clarification":
+    """Determine next node based on current state"""
+    current_node = state["current_node"]
+    
+    # Direct routing from router
+    if current_node == "websearch":
+        return "websearch"
+    elif current_node == "email_drafter":
+        return "email_drafter"
+    elif current_node == "memory":
+        return "memory"
+    elif current_node == "hitl":
         return "hitl"
+    elif current_node == "end":
+        return "end"
     else:
-        return "post_processing"
+        return END
 
-def should_continue_after_processing(state: GraphFlowState) -> str:
-    # Decide next step after post-processing
+def hitl_routing(state: GraphFlowState) -> str:
+    """Proper conditional function for HITL routing"""
+    if state.get("hitl_flag"):
+        return state.get("previous_node", "router")
+    else:
+        return "end"
+
+def websearch_routing(state: GraphFlowState) -> str:
+    """Routing from websearch node"""
     if state.get("hitl_active", False):
         return "hitl"
     else:
-        return END
+        return "end"
+
+def email_drafter_routing(state: GraphFlowState) -> str:
+    """Routing from email_drafter node"""
+    if state.get("hitl_active", False):
+        return "hitl"
+    else:
+        return "end"
         
 # Create the GraphFlow workflow
 def create_graphflow_workflow():
-    """Create and configure the GraphFlow workflow"""
+    """Create and configure the GraphFlow workflow with safe execution"""
     workflow = StateGraph(GraphFlowState)
     
-    # Add nodes
-    workflow.add_node("router", router_node)
-    workflow.add_node("web_search", web_search_node)
-    workflow.add_node("email_draft", email_draft_node)
-    workflow.add_node("post_processing", post_processing_node)
-    workflow.add_node("hitl", hitl_node)
-    workflow.add_node("memory", memory_node)
+    # Add nodes wrapped in safe execution
+    workflow.add_node("starter", lambda state: safe_node_execution(starter_node, state, "starter"))
+    workflow.add_node("router", lambda state: safe_node_execution(router_node, state, "router"))
+    workflow.add_node("websearch", lambda state: safe_node_execution(websearch_node, state, "websearch"))
+    workflow.add_node("email_drafter", lambda state: safe_node_execution(email_drafter_node, state, "email_drafter"))
+    workflow.add_node("hitl", lambda state: safe_node_execution(hitl_node, state, "hitl"))
+    workflow.add_node("memory", lambda state: safe_node_execution(memory_node, state, "memory"))
+    workflow.add_node("end", lambda state: safe_node_execution(end_node, state, "end"))
+    
+    # Add edges from starter to router
+    workflow.add_edge("starter", "router")
     
     # Add conditional edges from router
     workflow.add_conditional_edges(
         "router",
         should_continue,
         {
-            "web_search": "web_search",
-            "email_draft": "email_draft",
+            "websearch": "websearch",
+            "email_drafter": "email_drafter",
+            "memory": "memory",
             "hitl": "hitl",
-            "post_processing": "post_processing"
-        }
-    )
-    
-    # Add edges from main nodes to post-processing
-    workflow.add_edge("web_search", "post_processing")
-    workflow.add_edge("email_draft", "post_processing")
-    
-    # Add conditional edges from post-processing
-    workflow.add_conditional_edges(
-        "post_processing",
-        should_continue_after_processing,
-        {
-            "hitl": "hitl",
+            "end": "end",
             END: END
         }
     )
     
-    # Add edges to memory
-    workflow.add_edge("hitl", "memory")
-    workflow.add_edge("memory", END)
+    # Add conditional edges for iteration (WebSearch and Email only)
+    workflow.add_conditional_edges(
+        "websearch",
+        websearch_routing
+    )
+    
+    workflow.add_conditional_edges(
+        "email_drafter", 
+        email_drafter_routing
+    )
+    
+    # Add edges from HITL back to nodes for iteration
+    workflow.add_conditional_edges(
+        "hitl",
+        hitl_routing
+    )
+    
+    # Add edges to end
+    workflow.add_edge("memory", "end")
+    workflow.add_edge("end", END)
     
     # Set entry point
-    workflow.set_entry_point("router")
+    workflow.set_entry_point("starter")
     
     return workflow.compile()
 
@@ -505,17 +1008,25 @@ class GraphFlow:
     def process_query(self, user_query: str) -> Dict[str, Any]:
         """Process a user query through the GraphFlow workflow"""
         try:
-            # Initialize state
+            # Initialize state with all required fields
             initial_state = {
                 "messages": [HumanMessage(content=user_query)],
-                "current_node": "router",
+                "current_node": "starter",
+                "previous_node": "",
                 "hitl_active": False,
+                "hitl_flag": False,
                 "user_query": user_query,
                 "search_results": None,
                 "email_draft": None,
                 "email_recipient": None,
                 "memory_data": {},
-                "token_count": 0
+                "token_count": 0,
+                "query_type": "unknown",
+                "response": "",
+                "context": "",
+                "iteration_count": 0,
+                "max_iterations_reached": False,
+                "api_keys_available": check_api_keys()
             }
 
             # Process through workflow
@@ -547,13 +1058,22 @@ class GraphFlow:
             }
 
 def main():
-    """Main application entry point"""
-    print("GraphFlow - Human-in-the-Loop System")
-    print("=====================================")
+    """Main application entry point with graceful error handling"""
+    print("GraphFlow - Human-in-the-Loop System (Enhanced)")
+    print("===============================================")
     print("Type 'quit' to exit\n")
     
     # Initialize GraphFlow
     graphflow = GraphFlow()
+    
+    # Check API keys on startup
+    api_keys = check_api_keys()
+    print(f"API Keys Status: {api_keys}")
+    if not api_keys.get("google_api", False):
+        print("Warning: GOOGLE_API_KEY not found. Some features may not work.")
+    if not api_keys.get("serper_api", False):
+        print("Warning: SERPER_API_KEY not found. Search functionality will be limited.")
+    print()
     
     while True:
         try:
@@ -581,10 +1101,11 @@ def main():
                     print(f"\nGraphFlow: {follow_up_response['content']}\n")
         
         except KeyboardInterrupt:
-            print("\nGoodbye!")
+            print("\n\nGoodbye! Thanks for using GraphFlow!")
             break
         except Exception as e:
             print(f"Error: {str(e)}")
+            print("Please try again or type 'quit' to exit.")
 
 if __name__ == "__main__":
     main()
